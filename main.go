@@ -29,8 +29,8 @@ typedef struct {
 typedef struct {
 	uint32_t abi_version;
 	void* host_ctx;
-	void* call;
-	void* free_buffer;
+	int (*call)(void*, const char*, const uint8_t*, size_t, cliproxy_buffer*);
+	void (*free_buffer)(void*, size_t);
 } cliproxy_host_api;
 
 typedef int (*cliproxy_plugin_call_fn)(char*, uint8_t*, size_t, cliproxy_buffer*);
@@ -44,6 +44,13 @@ typedef struct {
 	cliproxy_plugin_shutdown_fn shutdown;
 } cliproxy_plugin_api;
 
+static int call_host(cliproxy_host_api* host, const char* method, const uint8_t* data, size_t len, cliproxy_buffer* out) {
+ if (!host || !host->call) return 1;
+ return host->call(host->host_ctx, method, data, len, out);
+}
+static void free_host(cliproxy_host_api* host, void* ptr, size_t len) {
+ if (host && host->free_buffer && ptr) host->free_buffer(ptr, len);
+}
 extern int cliproxyPluginCall(char*, uint8_t*, size_t, cliproxy_buffer*);
 extern void cliproxyPluginFree(void*, size_t);
 extern void cliproxyPluginShutdown(void);
@@ -52,6 +59,7 @@ import "C"
 
 import (
 	"encoding/json"
+	"fmt"
 	"html"
 	"log/slog"
 	"net/http"
@@ -59,6 +67,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -68,7 +77,7 @@ import (
 
 const (
 	pluginName    = "codex-429-autoban"
-	pluginVersion = "0.2.2"
+	pluginVersion = "0.2.3-local"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -109,6 +118,7 @@ type banEntry struct {
 	Window string
 	// BannedAt is when the ban was recorded, for logging only.
 	BannedAt time.Time
+	Owned    bool
 }
 
 // lookup returns the ban entry for the given auth ID and whether one exists.
@@ -205,10 +215,11 @@ func main() {}
 // function pointers.
 //
 //export cliproxy_plugin_init
-func cliproxy_plugin_init(_ *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
+func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
 	if plugin == nil {
 		return 1
 	}
+	nativeHost.Store(host)
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
@@ -249,12 +260,13 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 }
 
 //export cliproxyPluginShutdown
-func cliproxyPluginShutdown() {}
+func cliproxyPluginShutdown() { stopRecovery() }
 
 // handleMethod routes a CPA method to its handler.
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
+		startRecovery()
 		return okEnvelope(pluginRegistration())
 	case pluginabi.MethodUsageHandle:
 		return handleUsage(request)
@@ -282,9 +294,10 @@ func pluginRegistration() registration {
 			ConfigFields:     []pluginapi.ConfigField{},
 		},
 		Capabilities: registrationCapability{
-			UsagePlugin:   true,
-			Scheduler:     true,
-			ManagementAPI: true,
+			UsagePlugin:               true,
+			Scheduler:                 true,
+			SchedulerAcrossPriorities: true,
+			ManagementAPI:             true,
 		},
 	}
 }
@@ -317,6 +330,9 @@ func handleUsage(raw []byte) ([]byte, error) {
 
 	entry, ok := classifyAndBuildBan(record.ResponseHeaders)
 	if !ok {
+		entry, ok = banFromFailureBody(record.Failure.Body)
+	}
+	if !ok {
 		// Could not determine which window was hit from the headers.
 		// Fall back to a conservative 5-hour ban so the credential is not
 		// hammered while rate-limited, matching the more common case.
@@ -333,6 +349,9 @@ func handleUsage(raw []byte) ([]byte, error) {
 	}
 
 	banStore.set(authID, entry)
+	if err := disableCredential(authID, entry); err != nil {
+		slog.Warn("codex-429-autoban: credential disable pending", "auth_id", authID, "error", err)
+	}
 	slog.Info("codex-429-autoban: banned credential after 429",
 		"auth_id", authID,
 		"window", entry.Window,
@@ -357,8 +376,8 @@ func classifyAndBuildBan(headers http.Header) (banEntry, bool) {
 
 	primaryUsed := headerFloat(h, "x-codex-primary-used-percent")
 	secondaryUsed := headerFloat(h, "x-codex-secondary-used-percent")
-	primaryReset := headerUnixTime(h, "x-codex-primary-reset-at")
-	secondaryReset := headerUnixTime(h, "x-codex-secondary-reset-at")
+	primaryReset := headerResetTime(h, "x-codex-primary")
+	secondaryReset := headerResetTime(h, "x-codex-secondary")
 
 	// Prefer the explicit "which window is full" signal: the window whose
 	// used-percent reached the threshold. If both are present, pick the one
@@ -420,11 +439,10 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 		available = append(available, candidate)
 	}
 
-	// If every Codex candidate is banned (and there were no non-Codex ones),
-	// decline to handle so CPA's own logic can decide (e.g. wait on its
-	// built-in cooldown, or return an error). We do not force a pick here.
-	if len(available) == 0 {
-		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
+	// Explicitly reject when every candidate is banned. Handled=false would
+	// make CPA fall back to its built-in scheduler and select a banned account.
+	if len(available) == 0 && len(req.Candidates) > 0 {
+		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: true, Reject: true, RejectCode: "quota_exhausted", RejectReason: "all available credentials are waiting for quota recovery"})
 	}
 
 	// CPA applies our response as follows (conductor.go):
@@ -441,10 +459,7 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 	// nothing is banned we delegate to round-robin to preserve normal
 	// load-balancing.
 	if len(available) == len(req.Candidates) {
-		return okEnvelope(pluginapi.SchedulerPickResponse{
-			DelegateBuiltin: pluginapi.SchedulerBuiltinRoundRobin,
-			Handled:         true,
-		})
+		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
 	// Pick the available candidate with the highest numeric priority value
 	// (CPA's convention: higher priority value = higher precedence).
@@ -609,7 +624,11 @@ func handleManagementUnban(req pluginapi.ManagementRequest) pluginapi.Management
 		})
 	}
 
-	entry, removed := banStore.clear(authID)
+	entry, removed := banStore.lookup(authID)
+	if err := restoreCredential(authID, true); err != nil {
+		return jsonManagementResponse(http.StatusInternalServerError, map[string]any{"error": err.Error()})
+	}
+	banStore.clear(authID)
 	if removed {
 		slog.Info("codex-429-autoban: manually re-enabled credential",
 			"auth_id", authID, "window", entry.Window, "reset_at", entry.ResetAt.Format(time.RFC3339))
@@ -623,7 +642,14 @@ func handleManagementUnban(req pluginapi.ManagementRequest) pluginapi.Management
 }
 
 func handleManagementUnbanAll() pluginapi.ManagementResponse {
-	removed := banStore.clearAll()
+	snapshot := banStore.snapshot()
+	for id := range snapshot {
+		if err := restoreCredential(id, true); err != nil {
+			return jsonManagementResponse(http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		}
+	}
+	removed := len(snapshot)
+	banStore.clearAll()
 	if removed > 0 {
 		slog.Info("codex-429-autoban: manually re-enabled all credentials", "removed", removed)
 	}
@@ -841,7 +867,7 @@ POST /v0/management/plugins/codex-429-autoban/unban-all</pre>
 // ---- header helpers ----
 
 func headerFloat(h http.Header, key string) float64 {
-	raw := h.Get(key)
+	raw := getHeader(h, key)
 	if raw == "" {
 		return 0
 	}
@@ -853,7 +879,7 @@ func headerFloat(h http.Header, key string) float64 {
 }
 
 func headerInt(h http.Header, key string) int {
-	raw := h.Get(key)
+	raw := getHeader(h, key)
 	if raw == "" {
 		return 0
 	}
@@ -865,7 +891,7 @@ func headerInt(h http.Header, key string) int {
 }
 
 func headerUnixTime(h http.Header, key string) time.Time {
-	raw := h.Get(key)
+	raw := getHeader(h, key)
 	if raw == "" {
 		return time.Time{}
 	}
@@ -899,9 +925,10 @@ type registration struct {
 }
 
 type registrationCapability struct {
-	UsagePlugin   bool `json:"usage_plugin"`
-	Scheduler     bool `json:"scheduler"`
-	ManagementAPI bool `json:"management_api"`
+	UsagePlugin               bool `json:"usage_plugin"`
+	Scheduler                 bool `json:"scheduler"`
+	SchedulerAcrossPriorities bool `json:"scheduler_across_priorities"`
+	ManagementAPI             bool `json:"management_api"`
 }
 
 func okEnvelope(v any) ([]byte, error) {
@@ -927,4 +954,39 @@ func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 	}
 	response.ptr = ptr
 	response.len = C.size_t(len(raw))
+}
+
+var nativeHost atomic.Pointer[C.cliproxy_host_api]
+
+func nativeHostCall(method string, payload any) (json.RawMessage, error) {
+	host := nativeHost.Load()
+	if host == nil {
+		return nil, fmt.Errorf("CPA host callback unavailable")
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	cm := C.CString(method)
+	defer C.free(unsafe.Pointer(cm))
+	data := C.CBytes(raw)
+	defer C.free(data)
+	var out C.cliproxy_buffer
+	rc := C.call_host(host, cm, (*C.uint8_t)(data), C.size_t(len(raw)), &out)
+	if out.ptr == nil {
+		return nil, fmt.Errorf("host callback %s failed (%d)", method, rc)
+	}
+	defer C.free_host(host, out.ptr, out.len)
+	var env struct {
+		OK     bool            `json:"ok"`
+		Result json.RawMessage `json:"result"`
+		Error  json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(C.GoBytes(out.ptr, C.int(out.len)), &env); err != nil {
+		return nil, err
+	}
+	if rc != 0 || !env.OK {
+		return nil, fmt.Errorf("host callback %s: %s", method, env.Error)
+	}
+	return env.Result, nil
 }
